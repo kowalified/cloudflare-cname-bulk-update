@@ -176,19 +176,52 @@ def parse_bool(value):
     raise InputError("Invalid proxied value %r (use true or false)." % value)
 
 
+HEADER_ALIASES = {
+    "name": ("record", "record name", "hostname", "host", "fqdn", "cname", "domain"),
+    "content": ("target", "new target", "new content", "new value", "new cname", "value",
+                "destination", "points to"),
+}
+
+
+def map_headers(headers):
+    """Map the file's headers to canonical columns.
+
+    Returns (mapping {header: column}, notes). Exact canonical names win over aliases, and any
+    column we do not recognize is ignored, so a working spreadsheet can be used as it is.
+    """
+    cleaned = {h: re.sub(r"[\s_-]+", " ", h.strip().lower()) for h in headers}
+    mapping, notes = {}, []
+    for column in CSV_COLUMNS:
+        exact = [h for h, c in cleaned.items() if c == column]
+        aliased = [h for h, c in cleaned.items() if c in HEADER_ALIASES.get(column, ())]
+        if exact:
+            mapping[exact[0]] = column
+        elif len(aliased) == 1:
+            mapping[aliased[0]] = column
+            notes.append("using column %r as '%s'" % (aliased[0], column))
+        elif len(aliased) > 1:
+            raise InputError("Several columns could be '%s' (%s). Rename the right one to '%s'."
+                             % (column, ", ".join(repr(a) for a in aliased), column))
+    ignored = [h for h in headers if h not in mapping]
+    if ignored:
+        notes.append("ignoring columns: %s" % ", ".join(repr(h) for h in ignored))
+    return mapping, notes
+
+
 def read_csv(path, zone):
     """Rows of desired state. A blank cell means 'leave this field unchanged'."""
     rows = []
     with open(path, newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
-        headers = [h.strip().lower() for h in (reader.fieldnames or [])]
-        if "name" not in headers:
-            raise InputError("CSV needs at least a 'name' column. Found: %s" % ", ".join(headers))
-        unknown = [h for h in headers if h not in CSV_COLUMNS]
-        if unknown:
-            raise InputError("Unknown CSV column(s): %s" % ", ".join(unknown))
+        headers = [h for h in (reader.fieldnames or []) if h]
+        mapping, notes = map_headers(headers)
+        if "name" not in mapping.values():
+            raise InputError("CSV needs a column with the record names (call it 'name'). Found: %s"
+                             % ", ".join(headers))
+        for note in notes:
+            print("CSV: %s" % note)
         for line_no, raw in enumerate(reader, start=2):
-            row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items()}
+            row = {mapping[h]: (raw.get(h) or "").strip() for h in mapping}
             if not any(row.values()):
                 continue
             try:

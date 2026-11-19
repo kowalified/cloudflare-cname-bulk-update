@@ -26,34 +26,44 @@ This is an example script provided as-is, not an official Cloudflare product. Tr
 ## Workflow
 
 ```
-export  ->  edit the CSV  ->  plan (review)  ->  apply (confirm, backup, push, verify)  ->  rollback if needed
+your spreadsheet (CSV)  ->  plan (review)  ->  apply (confirm, backup, push, verify)  ->  rollback if needed
 ```
 
-**Quickest path, if you already have a spreadsheet of records and their new values:** save it as a CSV with two columns, `name` and `content` (the full record name and its new CNAME target), and skip to step 3.
-
-1. **Export** current CNAMEs (all zones the token can see, or one with `--zone`):
+1. **Save your list as a CSV.** You need one column with the full record name and one with its new CNAME target. For example:
    ```
-   python3 cf_cname_bulk_update.py export --out cnames.csv
-   python3 cf_cname_bulk_update.py --zone example.com export --out cnames.csv
+   name,content
+   app1.example.com,newtarget1.example.net
+   app2.example.org,newtarget2.example.net
    ```
-2. **Edit** `cnames.csv`. Change `content` (the CNAME target), `ttl`, `proxied`, or `comment`. Delete rows you do not want touched.
-   Blank cells mean "leave unchanged". `ttl` accepts seconds (30-86400) or `1`/`auto`. Only `name` is required, so a two-column `name,content` file works.
-3. **Plan** (read-only, shows before/after per zone):
+   - Your own spreadsheet works as it is. Extra columns (owner, ticket, notes) are ignored, and the script prints which columns it ignored.
+   - Common header names are recognized: `record`, `hostname`, `fqdn` for the name, and `target`, `new target`, `new value` for the new target. If two columns could be the same thing (say `target` and `new target`), it stops and asks you to rename one to `name` or `content`.
+   - Use full names (`app1.example.com`). Records can be in any mix of zones the token can see.
+   - Optional columns: `ttl` (seconds, 30-86400, or `1`/`auto`), `proxied` (`true`/`false`), `comment`, and `id`. Blank cells mean "leave unchanged".
+2. **Plan** (read-only, shows before/after per zone):
    ```
    python3 cf_cname_bulk_update.py plan --csv cnames.csv
    ```
-   Use full names (`app.example.com`). Each record is matched to the zone it belongs to. If any name matches no zone or no existing CNAME, nothing is applied.
-4. **Apply** (shows the same diff, asks for confirmation, writes a backup per zone, pushes, re-reads to verify):
+   Each record is matched to the zone it belongs to. If any name matches no zone or no existing CNAME, nothing is applied.
+3. **Apply** (shows the same diff, asks for confirmation, writes a backup per zone, pushes, re-reads to verify):
    ```
    python3 cf_cname_bulk_update.py apply --csv cnames.csv
    ```
    One zone: type the zone name to confirm. Several zones: type `apply`.
-5. **Rollback** using a backup file path printed by `apply` (one file per zone):
+4. **Rollback** using a backup file path printed by `apply` (one file per zone):
    ```
    python3 cf_cname_bulk_update.py rollback --backup backups/backup-example.com-<timestamp>.json
    ```
 
-Add `--zone example.com` to any command to limit it to one zone (this also lets the CSV use short names like `app` instead of `app.example.com`).
+Add `--zone example.com` to any command to limit it to one zone. This also lets the CSV use short names like `app` instead of `app.example.com`.
+
+### Optional: do not have a list yet?
+
+`export` writes the current CNAMEs (all zones the token can see, or one with `--zone`) to a CSV that you can edit and feed back into `plan`. It is also a handy snapshot of what is live before you change anything.
+```
+python3 cf_cname_bulk_update.py export --out cnames.csv
+python3 cf_cname_bulk_update.py --zone example.com export --out cnames.csv
+```
+Edit the `content`, `ttl`, `proxied`, or `comment` cells you want to change, and delete the rows you do not want touched.
 
 BIND input works too: `--zone example.com plan --bind zone.txt` (one zone per file). Only CNAME lines are read (`$ORIGIN` and `$TTL` are honored).
 
