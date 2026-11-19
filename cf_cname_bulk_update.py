@@ -462,6 +462,18 @@ def assign_zones(desired, zones):
 
 def run_plan_and_apply(client, zones, desired, apply_changes, args):
     groups, errors = assign_zones(desired, zones)
+    if getattr(args, "skip_unmatched", False):
+        skipped, errors = errors, []
+        if skipped:
+            print("Skipping %d record(s) in zones this token cannot see (--skip-unmatched):" % len(skipped))
+            for message in skipped[:20]:
+                print("  - %s" % message.split(":")[0])
+            if len(skipped) > 20:
+                print("  ... and %d more" % (len(skipped) - 20))
+            print()
+        if not groups:
+            print("None of the records are in a zone this token can see. Wrong token for this list?")
+            return 1
     plans = {}
     for zone in sorted(groups):
         current = list_cnames(client, zones[zone])
@@ -589,6 +601,9 @@ def build_parser():
         cmd.add_argument("--backup-dir", default="backups")
         cmd.add_argument("--yes", action="store_true", help="Skip the confirmation prompt")
         cmd.add_argument("--no-batch", action="store_true", help="PATCH one record at a time")
+        cmd.add_argument("--skip-unmatched", action="store_true",
+                         help="Skip records whose zone this token cannot see instead of stopping "
+                              "(run one CSV with several tokens, one per account)")
         cmd.set_defaults(func=func)
 
     rollback = sub.add_parser("rollback", help="Restore records from a backup file")

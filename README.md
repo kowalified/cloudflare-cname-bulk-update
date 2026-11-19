@@ -67,6 +67,17 @@ Edit the `content`, `ttl`, `proxied`, or `comment` cells you want to change, and
 
 BIND input works too: `--zone example.com plan --bind zone.txt` (one zone per file). Only CNAME lines are read (`$ORIGIN` and `$TTL` are honored).
 
+## Several Cloudflare accounts
+
+The script only sees zones that your token can see, and it prints them at the start of every run (`working across N zone(s): ...`). If a zone you expect is missing, the token does not cover it.
+
+- **One run for everything:** create the token under My Profile > API Tokens (a user token) and, in Zone Resources, add the zones from each account you belong to.
+- **One token per account:** account-owned tokens only cover their own account. Run the same CSV once per token with `--skip-unmatched`:
+  ```
+  python3 cf_cname_bulk_update.py plan --csv cnames.csv --skip-unmatched
+  ```
+  Records in zones the token cannot see are listed and skipped, and the rest are processed normally. Without this flag, a record in an unknown zone stops the whole run, which is the safer default because it catches typos. A name that is in a visible zone but has no matching CNAME still stops the run either way.
+
 ## Behavior worth knowing
 
 - Records are matched by `id` (from export) or by name. Duplicate names require the `id` column.
