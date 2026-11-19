@@ -8,7 +8,8 @@ Standard library only (Python 3.8+). Workflow:
     apply    Same comparison, then ask for confirmation, back up, push, and verify.
     rollback Restore records from a backup file written by `apply`.
 
-Auth: set CLOUDFLARE_API_TOKEN (needs Zone > DNS > Edit on the target zone only).
+Auth: set CLOUDFLARE_API_TOKEN (Zone > DNS > Edit and Zone > Zone > Read, scoped to the zones involved).
+With no --zone, records are matched to whichever of the token's zones they belong to.
 """
 
 import argparse
@@ -108,6 +109,18 @@ def resolve_zone(client, zone_name, zone_id):
     return result[0]["id"], result[0]["name"].lower()
 
 
+def list_zones(client):
+    """Every zone the token can see, as {zone_name: zone_id}."""
+    zones, page = {}, 1
+    while True:
+        payload = client.request("GET", "/zones", params={"page": page, "per_page": 50})
+        for zone in payload["result"]:
+            zones[zone["name"].lower()] = zone["id"]
+        if page >= (payload.get("result_info") or {}).get("total_pages", 1):
+            return zones
+        page += 1
+
+
 def list_cnames(client, zone_id):
     records, page = [], 1
     while True:
@@ -131,7 +144,12 @@ def normalize_host(value):
 
 
 def qualify_name(name, zone):
+    """Make a name fully qualified. With no zone, names must already be fully qualified."""
     name = normalize_host(name)
+    if zone is None:
+        if name in ("@", ""):
+            raise InputError("'@' needs --zone; otherwise use full names.")
+        return name
     if name in ("@", ""):
         return zone
     if name == zone or name.endswith("." + zone):
@@ -390,92 +408,133 @@ def write_backup(zone, changes, directory):
     return path
 
 
-def confirm(zone, assume_yes):
+def confirm(expected, assume_yes):
     if assume_yes:
         return True
-    answer = input("Type the zone name (%s) to confirm, anything else cancels: " % zone)
-    return answer.strip().lower() == zone
+    answer = input("Type %r to confirm, anything else cancels: " % expected)
+    return answer.strip().lower() == expected
 
 
-def run_plan_and_apply(client, zone_id, zone, desired, apply_changes, args):
-    current = list_cnames(client, zone_id)
-    changes, unchanged, errors = build_plan(current, desired)
-    print_plan(zone, changes, unchanged, errors, len(desired))
+def assign_zones(desired, zones):
+    """Group desired rows by the most specific zone each name belongs to."""
+    groups, errors = {}, []
+    for row in desired:
+        matches = [z for z in zones if row["name"] == z or row["name"].endswith("." + z)]
+        if not matches:
+            errors.append("%s: not in any zone this token can see" % row["name"])
+            continue
+        groups.setdefault(max(matches, key=len), []).append(row)
+    return groups, errors
+
+
+def run_plan_and_apply(client, zones, desired, apply_changes, args):
+    groups, errors = assign_zones(desired, zones)
+    plans = {}
+    for zone in sorted(groups):
+        current = list_cnames(client, zones[zone])
+        changes, unchanged, zone_errors = build_plan(current, groups[zone])
+        plans[zone] = changes
+        errors.extend(zone_errors)
+        print_plan(zone, changes, unchanged, zone_errors, len(groups[zone]))
+    unassigned = [e for e in errors if "not in any zone" in e]
+    if unassigned:
+        print("Names that matched no zone:")
+        for message in unassigned:
+            print("  ! %s" % message)
+        print()
     if errors:
+        print("Fix the problems above and try again. Nothing was changed.")
         return 1
-    if not changes:
+    zones_to_change = [z for z in sorted(plans) if plans[z]]
+    total = sum(len(plans[z]) for z in zones_to_change)
+    if not total:
         print("Nothing to change.")
         return 0
+    if len(zones_to_change) > 1:
+        print("TOTAL: %d record(s) across %d zones (%s)\n"
+              % (total, len(zones_to_change), ", ".join(zones_to_change)))
     if not apply_changes:
         print("Dry run only. Re-run with the `apply` command to push these changes.")
         return 0
-    if not confirm(zone, args.yes):
+    expected = zones_to_change[0] if len(zones_to_change) == 1 else "apply"
+    if not confirm(expected, args.yes):
         print("Cancelled. No changes were made.")
         return 1
-    backup_path = write_backup(zone, changes, args.backup_dir)
-    print("Backup written: %s" % backup_path)
-    push_changes(client, zone_id, changes, use_batch=not args.no_batch)
-    failures = verify(client, zone_id, changes)
-    if failures:
-        print("\nVERIFY FAILED:")
-        for message in failures:
-            print("  ! %s" % message)
-        print("Restore with: rollback --backup %s" % backup_path)
-        return 2
-    print("\nVerified %d record(s) match the plan. Roll back with: rollback --backup %s"
-          % (len(changes), backup_path))
-    return 0
+
+    exit_code, backups = 0, []
+    for zone in zones_to_change:
+        changes = plans[zone]
+        backup_path = write_backup(zone, changes, args.backup_dir)
+        backups.append((zone, backup_path))
+        print("[%s] backup written: %s" % (zone, backup_path))
+        push_changes(client, zones[zone], changes, use_batch=not args.no_batch)
+        failures = verify(client, zones[zone], changes)
+        if failures:
+            exit_code = 2
+            print("[%s] VERIFY FAILED:" % zone)
+            for message in failures:
+                print("  ! %s" % message)
+        else:
+            print("[%s] verified %d record(s) match the plan" % (zone, len(changes)))
+    print("\nTo undo:")
+    for zone, path in backups:
+        print("  rollback --backup %s" % path)
+    return exit_code
 
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-def cmd_export(client, zone_id, zone, args):
-    records = list_cnames(client, zone_id)
+def cmd_export(client, zones, args):
+    rows = []
+    for zone in sorted(zones):
+        rows.extend(list_cnames(client, zones[zone]))
     if args.name_contains:
-        records = [r for r in records if args.name_contains.lower() in r["name"].lower()]
-    records.sort(key=lambda r: r["name"])
+        rows = [r for r in rows if args.name_contains.lower() in r["name"].lower()]
+    rows.sort(key=lambda r: r["name"])
     with open(args.out, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         writer.writerow(CSV_COLUMNS)
-        for rec in records:
+        for rec in rows:
             writer.writerow([rec["id"], normalize_host(rec["name"]), normalize_host(rec["content"]),
                              rec.get("ttl"), "true" if rec.get("proxied") else "false",
                              rec.get("comment") or ""])
-    print("Exported %d CNAME record(s) from %s to %s" % (len(records), zone, args.out))
+    print("Exported %d CNAME record(s) from %d zone(s) to %s" % (len(rows), len(zones), args.out))
     print("Edit the content/ttl/proxied/comment cells you want to change and delete rows you do not.")
     return 0
 
 
-def load_desired(args, zone):
+def load_desired(args):
     if args.csv:
-        return read_csv(args.csv, zone)
-    return parse_bind(args.bind, zone)
+        return read_csv(args.csv, args.zone)
+    if not args.zone:
+        raise InputError("--bind needs --zone (a BIND file describes one zone).")
+    return parse_bind(args.bind, args.zone)
 
 
-def cmd_plan(client, zone_id, zone, args):
-    return run_plan_and_apply(client, zone_id, zone, load_desired(args, zone), False, args)
+def cmd_plan(client, zones, args):
+    return run_plan_and_apply(client, zones, load_desired(args), False, args)
 
 
-def cmd_apply(client, zone_id, zone, args):
-    return run_plan_and_apply(client, zone_id, zone, load_desired(args, zone), True, args)
+def cmd_apply(client, zones, args):
+    return run_plan_and_apply(client, zones, load_desired(args), True, args)
 
 
-def cmd_rollback(client, zone_id, zone, args):
+def cmd_rollback(client, zones, args):
     with open(args.backup, encoding="utf-8") as handle:
         backup = json.load(handle)
-    if backup["zone"] != zone:
-        raise InputError("Backup is for zone %s but you selected %s." % (backup["zone"], zone))
+    if backup["zone"] not in zones:
+        raise InputError("Backup is for zone %s, which this token/selection cannot see." % backup["zone"])
     desired = [{"id": r["id"], "name": r["name"], "content": r["content"], "ttl": r["ttl"],
                 "proxied": r["proxied"], "comment": r["comment"]} for r in backup["records"]]
     print("Rolling back %d record(s) from %s" % (len(desired), args.backup))
-    return run_plan_and_apply(client, zone_id, zone, desired, True, args)
+    return run_plan_and_apply(client, {backup["zone"]: zones[backup["zone"]]}, desired, True, args)
 
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--zone", help="Zone name, e.g. example.com")
+    parser.add_argument("--zone", help="Limit to one zone, e.g. example.com. Omit to work across every zone the token can see")
     parser.add_argument("--zone-id", help="Zone ID (skips the name lookup)")
     parser.add_argument("--api-base", default=os.environ.get("CLOUDFLARE_API_BASE", API_BASE_DEFAULT),
                         help=argparse.SUPPRESS)
@@ -516,8 +575,16 @@ def main(argv=None):
         return 1
     client = Client(token, args.api_base, args.ca_bundle)
     try:
-        zone_id, zone = resolve_zone(client, args.zone and normalize_host(args.zone), args.zone_id)
-        return args.func(client, zone_id, zone, args)
+        if args.zone or args.zone_id:
+            zone_id, zone_name = resolve_zone(client, args.zone and normalize_host(args.zone), args.zone_id)
+            args.zone = zone_name
+            zones = {zone_name: zone_id}
+        else:
+            zones = list_zones(client)
+            if not zones:
+                raise InputError("The token cannot see any zones (needs Zone > Zone > Read).")
+            print("No --zone given: working across %d zone(s): %s\n" % (len(zones), ", ".join(sorted(zones))))
+        return args.func(client, zones, args)
     except (InputError, CloudflareError, OSError) as exc:
         print("Error: %s" % exc, file=sys.stderr)
         return 1
